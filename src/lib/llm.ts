@@ -4,7 +4,7 @@
  * No automated privilege or relevance decisions.
  */
 
-import OpenAI from "openai";
+import { OpenAI } from "openai";
 import { createSupabaseClient } from "./supabase.js";
 import { getDocumentText } from "./embeddings.js";
 import { downloadDocument } from "./storage.js";
