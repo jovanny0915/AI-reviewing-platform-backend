@@ -3,7 +3,7 @@
  * Optional semantic search / find-similar when user explicitly requests.
  */
 
-import OpenAI from "openai";
+import { OpenAI } from "openai";
 import { createSupabaseClient } from "./supabase.js";
 import { downloadDocument } from "./storage.js";
 
