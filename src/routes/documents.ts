@@ -45,20 +45,41 @@ function applyListFilters<T>(query: T, filters: ListFilters): T {
   return q as T;
 }
 
-/** Phase 4: Get folder ID and all descendant folder IDs when includeSubfolders is true. */
+/**
+ * Phase 4: Get folder ID and all descendant folder IDs when includeSubfolders is true.
+ * Per IMPLEMENTATION_PLAN.md: folders (id, name, parent_id); list by folder with optional subfolders.
+ * Only includes descendant folders in the same matter (matter-level isolation).
+ */
 async function getFolderIdsForFilter(
   folderId: string,
   includeSubfolders: boolean
 ): Promise<string[]> {
   if (!includeSubfolders) return [folderId];
-  const { data: allFolders } = await supabase.from("folders").select("id, parent_id");
-  const rows = (allFolders ?? []) as { id: string; parent_id: string | null }[];
+
+  const { data: folder, error: folderErr } = await supabase
+    .from("folders")
+    .select("id, matter_id")
+    .eq("id", folderId)
+    .single();
+  if (folderErr || !folder) return [folderId];
+
+  const matterId = (folder as { matter_id: string | null }).matter_id ?? null;
+  let foldersQuery = supabase.from("folders").select("id, parent_id");
+  if (matterId !== null) {
+    foldersQuery = foldersQuery.eq("matter_id", matterId);
+  } else {
+    foldersQuery = foldersQuery.is("matter_id", null);
+  }
+  const { data: rows } = await foldersQuery;
+  const flat = (rows ?? []) as { id: string; parent_id: string | null }[];
+
   const byParent = new Map<string, string[]>();
-  for (const r of rows) {
+  for (const r of flat) {
     const p = r.parent_id ?? "";
     if (!byParent.has(p)) byParent.set(p, []);
     byParent.get(p)!.push(r.id);
   }
+
   const result: string[] = [];
   const stack: string[] = [folderId];
   while (stack.length > 0) {

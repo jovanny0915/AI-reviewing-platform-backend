@@ -20,6 +20,7 @@ export type FolderNode = FolderRow & {
 
 /**
  * Build a tree from flat folder rows (parent_id hierarchy).
+ * Per IMPLEMENTATION_PLAN.md Phase 4.1: folders (id, name, parent_id).
  */
 function buildFolderTree(rows: FolderRow[], parentId: string | null): FolderNode[] {
   return rows
@@ -29,6 +30,30 @@ function buildFolderTree(rows: FolderRow[], parentId: string | null): FolderNode
       children: buildFolderTree(rows, row.id),
       document_count: 0,
     }));
+}
+
+/**
+ * For each folder, build set of folder ids that are this folder or any descendant (for count-including-subfolders).
+ */
+function buildDescendantIdsByFolder(flat: FolderRow[]): Map<string, Set<string>> {
+  const byParent = new Map<string, string[]>();
+  for (const r of flat) {
+    const p = r.parent_id ?? "";
+    if (!byParent.has(p)) byParent.set(p, []);
+    byParent.get(p)!.push(r.id);
+  }
+  const result = new Map<string, Set<string>>();
+  function collect(folderId: string): Set<string> {
+    if (result.has(folderId)) return result.get(folderId)!;
+    const set = new Set<string>([folderId]);
+    for (const childId of byParent.get(folderId) ?? []) {
+      for (const id of collect(childId)) set.add(id);
+    }
+    result.set(folderId, set);
+    return set;
+  }
+  for (const f of flat) collect(f.id);
+  return result;
 }
 
 /**
@@ -47,21 +72,29 @@ router.get("/", async (req: Request, res: Response) => {
     const flat = (rows ?? []) as FolderRow[];
     const tree = buildFolderTree(flat, null);
 
-    // Get document counts per folder (including subfolders: count docs in folder and all descendants)
-    const folderIds = flat.map((f) => f.id);
-    if (folderIds.length === 0) {
+    if (flat.length === 0) {
       return success(res, { folders: tree });
     }
-    const { data: counts } = await supabase
+
+    // Per Phase 4.3: document_count = docs in this folder and all descendant subfolders (matches list by folder + includeSubfolders)
+    const descendantIdsByFolder = buildDescendantIdsByFolder(flat);
+    const { data: docFolderRows } = await supabase
       .from("document_folders")
       .select("folder_id")
-      .in("folder_id", folderIds);
+      .in("folder_id", flat.map((f) => f.id));
+    const rowsList = (docFolderRows ?? []) as { folder_id: string }[];
+
     const countByFolder = new Map<string, number>();
-    for (const f of folderIds) countByFolder.set(f, 0);
-    for (const row of counts ?? []) {
-      const r = row as { folder_id: string };
-      countByFolder.set(r.folder_id, (countByFolder.get(r.folder_id) ?? 0) + 1);
+    for (const f of flat) countByFolder.set(f.id, 0);
+    for (const row of rowsList) {
+      const fid = row.folder_id;
+      for (const [folderId, idSet] of descendantIdsByFolder) {
+        if (idSet.has(fid)) {
+          countByFolder.set(folderId, (countByFolder.get(folderId) ?? 0) + 1);
+        }
+      }
     }
+
     function setCounts(nodes: FolderNode[]): void {
       for (const n of nodes) {
         n.document_count = countByFolder.get(n.id) ?? 0;
