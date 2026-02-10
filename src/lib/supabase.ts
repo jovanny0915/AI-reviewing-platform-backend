@@ -15,7 +15,7 @@ export function createSupabaseClient() {
       persistSession: false,
     },
     global: {
-      fetch: fetch as typeof globalThis.fetch,
+      fetch: fetch as unknown as typeof globalThis.fetch,
     },
   });
 }

@@ -56,7 +56,7 @@ export async function burnInRedactions(
     const rh = Math.max(1, Math.round(r.height * h));
     return {
       input: Buffer.alloc(rw * rh * 3, 0),
-      raw: { width: rw, height: rh, channels: 3 },
+      raw: { width: rw, height: rh, channels: 3 as const },
       left,
       top,
     };
