@@ -1,15 +1,23 @@
 /**
  * Phase 7: Productions API — create production, start job, list, get, audit report, download.
+ * Phase 8: Inbound productions — list import jobs, POST import (multipart DAT/OPT + tiff path).
  */
 
 import { Router, Request, Response } from "express";
+import multer from "multer";
 import { createSupabaseClient } from "../lib/supabase.js";
 import { success, error } from "../lib/api-response.js";
 import { enqueueProduction } from "../lib/queue.js";
 import { createSignedUrl } from "../lib/storage.js";
+import { runInboundImport } from "../lib/inbound-import-job.js";
 
 const router = Router();
 const supabase = createSupabaseClient();
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB for load files
+});
 
 export type ProductionRow = {
   id: string;
@@ -116,6 +124,156 @@ router.post("/", async (req: Request, res: Response) => {
       return error(res, dbError.message, 500, (dbError as { code?: string }).code ?? "DB_ERROR");
     }
     return success(res, production as ProductionRow, 201);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return error(res, message, 500, "INTERNAL_ERROR");
+  }
+});
+
+// --- Phase 8: Inbound productions (must be before /:id) ---
+
+export type InboundProductionRow = {
+  id: string;
+  matter_id: string | null;
+  name: string;
+  producing_party: string | null;
+  status: string;
+  dat_storage_path: string | null;
+  opt_storage_path: string | null;
+  tiff_base_path: string | null;
+  error_message: string | null;
+  document_count: number;
+  created_at: string;
+  completed_at: string | null;
+};
+
+/**
+ * GET /api/productions/import
+ * List inbound production imports.
+ */
+router.get("/import", async (req: Request, res: Response) => {
+  try {
+    const matterId = req.query.matter_id as string | undefined;
+    const status = req.query.status as string | undefined;
+    let query = supabase
+      .from("inbound_productions")
+      .select("*", { count: "exact" })
+      .order("created_at", { ascending: false });
+    if (matterId) query = query.eq("matter_id", matterId);
+    if (status) query = query.eq("status", status);
+    const { data: rows, error: dbError, count } = await query;
+    if (dbError) {
+      return error(res, dbError.message, 500, (dbError as { code?: string }).code ?? "DB_ERROR");
+    }
+    return success(res, {
+      imports: (rows ?? []) as InboundProductionRow[],
+      total: count ?? (rows?.length ?? 0),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return error(res, message, 500, "INTERNAL_ERROR");
+  }
+});
+
+/**
+ * POST /api/productions/import
+ * Create inbound import job: multipart name, producing_party, matter_id?, tiff_base_path, dat (file), opt (file optional).
+ * Runs import synchronously and returns when complete (or failed).
+ */
+router.post(
+  "/import",
+  upload.fields([
+    { name: "dat", maxCount: 1 },
+    { name: "opt", maxCount: 1 },
+  ]),
+  async (req: Request, res: Response) => {
+    try {
+      const body = req.body as { name?: string; producing_party?: string; matter_id?: string; tiff_base_path?: string };
+      const name = typeof body.name === "string" ? body.name.trim() : "";
+      const producing_party = typeof body.producing_party === "string" ? body.producing_party.trim() : null;
+      const matter_id = typeof body.matter_id === "string" && body.matter_id.trim() ? body.matter_id.trim() : null;
+      const tiff_base_path = typeof body.tiff_base_path === "string" ? body.tiff_base_path.trim() : "";
+      const files = (req as Request & { files?: { dat?: Express.Multer.File[]; opt?: Express.Multer.File[] } }).files;
+      const datFile = files?.dat?.[0];
+      const optFile = files?.opt?.[0];
+
+      if (!name) {
+        return error(res, "name is required", 400, "VALIDATION");
+      }
+      if (!datFile || !datFile.buffer) {
+        return error(res, "DAT file is required", 400, "VALIDATION");
+      }
+      if (!tiff_base_path) {
+        return error(res, "tiff_base_path is required", 400, "VALIDATION");
+      }
+
+      const datContent = datFile.buffer.toString("utf-8");
+      const optContent = optFile?.buffer ? optFile.buffer.toString("utf-8") : null;
+
+      const { data: row, error: insertErr } = await supabase
+        .from("inbound_productions")
+        .insert({
+          name,
+          producing_party,
+          matter_id,
+          tiff_base_path,
+          status: "processing",
+          document_count: 0,
+        })
+        .select()
+        .single();
+
+      if (insertErr) {
+        return error(res, insertErr.message, 500, "DB_ERROR");
+      }
+      const importId = (row as InboundProductionRow).id;
+
+      const result = await runInboundImport({
+        inboundProductionId: importId,
+        datContent,
+        optContent,
+        tiffBasePath: tiff_base_path,
+        matterId: matter_id,
+      });
+
+      if (result.error) {
+        return success(res, {
+          id: importId,
+          status: "failed",
+          document_count: result.documentCount,
+          error_message: result.error,
+        }, 201);
+      }
+
+      return success(res, {
+        id: importId,
+        status: "complete",
+        document_count: result.documentCount,
+        error_message: null,
+      }, 201);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      return error(res, message, 500, "INTERNAL_ERROR");
+    }
+  }
+);
+
+/**
+ * GET /api/productions/import/:id
+ * Get one inbound import job.
+ */
+router.get("/import/:id", async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { data: row, error: dbError } = await supabase
+      .from("inbound_productions")
+      .select("*")
+      .eq("id", id)
+      .single();
+    if (dbError || !row) {
+      return error(res, "Import not found", 404, "NOT_FOUND");
+    }
+    return success(res, row as InboundProductionRow);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return error(res, message, 500, "INTERNAL_ERROR");
